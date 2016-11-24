@@ -1,6 +1,6 @@
 ﻿// Copyright (c) Josef Pihrt. All rights reserved. Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
-using System.Collections.Immutable;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Text;
 using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
 using static Roslynator.CSharp.CSharpFactory;
 
@@ -47,24 +48,16 @@ namespace Roslynator.CSharp.Refactorings
                                     ITypeSymbol typeSymbol = semanticModel.GetTypeSymbol(variableDeclaration.Type, cancellationToken);
 
                                     if (typeSymbol?.SupportsConstantValue() == true
-                                        && variables.All(variable => semanticModel.HasConstantValue(variable, cancellationToken)))
+                                        && variables.All(variable => HasConstantValue(variable.Initializer?.Value, typeSymbol, semanticModel, cancellationToken)))
                                     {
-                                        DataFlowAnalysis analysis = semanticModel.AnalyzeDataFlow(statements[index + 1], statements.Last());
+                                        TextSpan span = TextSpan.FromBounds(statements[index + 1].Span.Start, statements.Last().Span.End);
+                                        IEnumerable<SyntaxNode> nodes = block.DescendantNodes(span);
 
-                                        if (analysis.Succeeded)
-                                        {
-                                            ImmutableArray<ISymbol> writtenInside = analysis.WrittenInside;
-                                            ImmutableArray<ISymbol> readInside = analysis.ReadInside;
-
-                                            return variables.All(f =>
-                                            {
-                                                ISymbol symbol = semanticModel.GetDeclaredSymbol(f, cancellationToken);
-
-                                                return symbol?.IsErrorType() == false
-                                                    && !writtenInside.Contains(symbol)
-                                                    && readInside.Contains(symbol);
-                                            });
-                                        }
+                                        return !IsAnyVariableInvalidOrAssigned(
+                                            variables,
+                                            nodes,
+                                            semanticModel,
+                                            cancellationToken);
                                     }
                                 }
                             }
@@ -74,6 +67,153 @@ namespace Roslynator.CSharp.Refactorings
             }
 
             return false;
+        }
+
+        private static bool IsAnyVariableInvalidOrAssigned(SeparatedSyntaxList<VariableDeclaratorSyntax> variables, IEnumerable<SyntaxNode> nodes, SemanticModel semanticModel, CancellationToken cancellationToken)
+        {
+            List<ISymbol> localSymbols = null;
+
+            foreach (SyntaxNode node in nodes)
+            {
+                if (node.IsKind(SyntaxKind.IdentifierName))
+                {
+                    ISymbol symbol = semanticModel.GetSymbol(node, cancellationToken);
+
+                    if (symbol?.IsLocal() == true)
+                    {
+                        if (localSymbols == null)
+                        {
+                            localSymbols = new List<ISymbol>();
+
+                            foreach (VariableDeclaratorSyntax variable in variables)
+                            {
+                                ISymbol localSymbol = semanticModel.GetDeclaredSymbol(variable, cancellationToken);
+
+                                if (localSymbol?.IsLocal() == true)
+                                {
+                                    localSymbols.Add(localSymbol);
+                                }
+                                else
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+
+                        if (localSymbols.Contains(symbol))
+                        {
+                            ExpressionSyntax expression = GetAssignedExpression(node);
+
+                            if (expression != null)
+                            {
+                                ISymbol expressionSymbol = semanticModel.GetSymbol(expression, cancellationToken);
+
+                                if (localSymbols.Any(localSymbol => localSymbol.Equals(expressionSymbol)))
+                                    return true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static bool HasConstantValue(
+            ExpressionSyntax expression,
+            ITypeSymbol typeSymbol,
+            SemanticModel semanticModel,
+            CancellationToken cancellationToken)
+        {
+            if (expression?.IsMissing == false)
+            {
+                switch (typeSymbol.SpecialType)
+                {
+                    case SpecialType.System_Boolean:
+                        {
+                            if (expression.IsBooleanLiteralExpression())
+                                return true;
+
+                            break;
+                        }
+                    case SpecialType.System_Char:
+                        {
+                            if (expression.IsKind(SyntaxKind.CharacterLiteralExpression))
+                                return true;
+
+                            break;
+                        }
+                    case SpecialType.System_SByte:
+                    case SpecialType.System_Byte:
+                    case SpecialType.System_Int16:
+                    case SpecialType.System_UInt16:
+                    case SpecialType.System_Int32:
+                    case SpecialType.System_UInt32:
+                    case SpecialType.System_Int64:
+                    case SpecialType.System_UInt64:
+                    case SpecialType.System_Decimal:
+                    case SpecialType.System_Single:
+                    case SpecialType.System_Double:
+                        {
+                            if (expression.IsKind(SyntaxKind.NumericLiteralExpression))
+                                return true;
+
+                            break;
+                        }
+                    case SpecialType.System_String:
+                        {
+                            if (expression.IsKind(SyntaxKind.StringLiteralExpression))
+                                return true;
+
+                            break;
+                        }
+                }
+
+                return semanticModel.HasConstantValue(expression, cancellationToken);
+            }
+
+            return false;
+        }
+
+        private static ExpressionSyntax GetAssignedExpression(SyntaxNode node)
+        {
+            for (node = node.Parent; node != null; node = node.Parent)
+            {
+                switch (node.Kind())
+                {
+                    case SyntaxKind.SimpleAssignmentExpression:
+                    case SyntaxKind.AddAssignmentExpression:
+                    case SyntaxKind.SubtractAssignmentExpression:
+                    case SyntaxKind.MultiplyAssignmentExpression:
+                    case SyntaxKind.DivideAssignmentExpression:
+                    case SyntaxKind.ModuloAssignmentExpression:
+                    case SyntaxKind.AndAssignmentExpression:
+                    case SyntaxKind.ExclusiveOrAssignmentExpression:
+                    case SyntaxKind.OrAssignmentExpression:
+                    case SyntaxKind.LeftShiftAssignmentExpression:
+                    case SyntaxKind.RightShiftAssignmentExpression:
+                        return ((AssignmentExpressionSyntax)node).Left;
+                    case SyntaxKind.PreIncrementExpression:
+                    case SyntaxKind.PreDecrementExpression:
+                        return ((PrefixUnaryExpressionSyntax)node).Operand;
+                    case SyntaxKind.PostIncrementExpression:
+                    case SyntaxKind.PostDecrementExpression:
+                        return ((PostfixUnaryExpressionSyntax)node).Operand;
+                    case SyntaxKind.Argument:
+                        {
+                            var argument = (ArgumentSyntax)node;
+
+                            if (!argument.RefOrOutKeyword.IsNoneKind())
+                                return argument.Expression;
+
+                            break;
+                        }
+                    case SyntaxKind.Block:
+                        return null;
+                }
+            }
+
+            return null;
         }
 
         public static async Task<Document> RefactorAsync(
